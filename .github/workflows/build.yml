@@ -6,12 +6,18 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Check out fork (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
 
       - name: Keep the patch, switch to the Replay Mod 2.6.15 source
         run: |
@@ -22,13 +28,15 @@ jobs:
       - name: Apply patch
         run: git apply --verbose /tmp/custom.patch
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+      - name: Build the preprocessor plugin locally (the JitPack copy is missing)
+        run: |
+          git clone https://github.com/ReplayMod/preprocessor /tmp/preprocessor
+          cd /tmp/preprocessor
+          git checkout 48e02ad
+          sed -i 's/version = "SNAPSHOT"/version = "48e02ad"/' build.gradle.kts
+          ./gradlew publishToMavenLocal --no-daemon --stacktrace
 
-      - name: Build
+      - name: Build Replay Mod
         run: ./gradlew :1.19.2:bundleJar --no-daemon --stacktrace
 
       - name: Upload jar
