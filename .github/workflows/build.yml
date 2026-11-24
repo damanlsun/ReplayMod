@@ -28,6 +28,11 @@ jobs:
       - name: Apply patch
         run: git apply --verbose /tmp/custom.patch
 
+      - name: Fix 1.16.4 method name (safe even if the patch already has it)
+        run: |
+          sed -i 's/instance\.isRelative()/instance.isLooping()/' src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
+          grep -n "isLooping\|isRelative" src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
+
       - name: Build the preprocessor plugin locally (the JitPack copy is missing)
         run: |
           git clone https://github.com/ReplayMod/preprocessor /tmp/preprocessor
