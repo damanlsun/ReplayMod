@@ -37,7 +37,25 @@ jobs:
           ./gradlew publishToMavenLocal --no-daemon --stacktrace
 
       - name: Build Replay Mod
-        run: ./gradlew :1.19.2:bundleJar --no-daemon --stacktrace
+        shell: bash
+        run: ./gradlew :1.19.2:bundleJar --no-daemon 2>&1 | tee build.log
+
+      - name: Show only the errors (copy this step's output if the build failed)
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== compile errors ==="
+          grep -n -B1 -A4 -E "error:|error\[|\.java:[0-9]+: " build.log | head -150
+          echo "=== what went wrong ==="
+          grep -n -A12 "What went wrong" build.log | head -60
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
