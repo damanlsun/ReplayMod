@@ -1,0 +1,1036 @@
+diff --git a/src/main/java/com/replaymod/render/RenderSettings.java b/src/main/java/com/replaymod/render/RenderSettings.java
+index f5e92ffb..811964fa 100644
+--- a/src/main/java/com/replaymod/render/RenderSettings.java
++++ b/src/main/java/com/replaymod/render/RenderSettings.java
+@@ -168,6 +168,10 @@ public class RenderSettings {
+ 
+     private final boolean highPerformance;
+ 
++    // Custom options (not part of the constructor so existing callers / saved JSON keep working)
++    private boolean renderHud = true;
++    private boolean recordSound = true;
++
+     public RenderSettings() {
+         this(
+                 RenderSettings.RenderMethod.DEFAULT,
+@@ -267,7 +271,31 @@ public class RenderSettings {
+                 exportCommand,
+                 exportArguments,
+                 highPerformance
+-        );
++        ).withCustomOptions(renderHud, recordSound);
++    }
++
++    public RenderSettings withCustomOptions(boolean renderHud, boolean recordSound) {
++        this.renderHud = renderHud;
++        this.recordSound = recordSound;
++        return this;
++    }
++
++    public RenderSettings withCustomOptionsFrom(RenderSettings other) {
++        return withCustomOptions(other.renderHud, other.recordSound);
++    }
++
++    /** Whether the in-game HUD (hotbar, crosshair, hand, ...) is rendered into the video. Only for the default render method. */
++    public boolean isRenderHud() {
++        return renderHud && renderMethod == RenderMethod.DEFAULT;
++    }
++
++    public boolean isRenderHudRaw() {
++        return renderHud;
++    }
++
++    /** Whether game sounds are recorded and muxed into the video. */
++    public boolean isRecordSound() {
++        return recordSound;
+     }
+ 
+     /**
+diff --git a/src/main/java/com/replaymod/render/audio/AudioMixer.java b/src/main/java/com/replaymod/render/audio/AudioMixer.java
+new file mode 100644
+index 00000000..a38cb001
+--- /dev/null
++++ b/src/main/java/com/replaymod/render/audio/AudioMixer.java
+@@ -0,0 +1,206 @@
++package com.replaymod.render.audio;
++
++import java.io.BufferedOutputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++
++import static com.replaymod.render.audio.SoundRecorder.SAMPLE_RATE;
++
++/**
++ * Offline stereo mixer approximating Minecraft's OpenAL output: linear distance attenuation,
++ * constant-power left/right panning relative to the camera's yaw, and pitch (resampling) of the sound.
++ * Free of Minecraft dependencies.
++ */
++public final class AudioMixer {
++    private static final int CHUNK = 512;
++
++    private static final class Voice {
++        final SoundRecorder.Event event;
++        final float[] data; // mono, SAMPLE_RATE
++        final long start;
++        final long end;
++        final double pitch;
++
++        Voice(SoundRecorder.Event event, float[] data) {
++            this.event = event;
++            this.data = data;
++            this.start = Math.round(event.time * SAMPLE_RATE);
++            this.pitch = event.pitch;
++            this.end = start + (long) Math.ceil(data.length / pitch);
++        }
++    }
++
++    private AudioMixer() {}
++
++    /** Result of mixing. */
++    public static final class MixResult {
++        public final int mixed;
++        /** Highest sample value of the written file, 0..1 */
++        public final double peak;
++
++        MixResult(int mixed, double peak) {
++            this.mixed = mixed;
++            this.peak = peak;
++        }
++
++        /** Linear gain that brings the loudest moment to about -1 dBFS (never attenuates, at most +30 dB). */
++        public double normalizeGain() {
++            if (peak <= 1e-5) return 1;
++            return Math.max(1, Math.min(31.6, 0.89 / peak));
++        }
++    }
++
++    /**
++     * @param pcm decoded mono samples (at {@link SoundRecorder#SAMPLE_RATE}) by {@link SoundRecorder.Event#key()};
++     *            events without an entry are skipped
++     */
++    public static MixResult mixToWav(SoundRecorder.Snapshot snapshot, Map<String, float[]> pcm, int totalFrames, File output) throws IOException {
++        long totalSamples = Math.round(totalFrames * (double) SAMPLE_RATE / snapshot.fps);
++
++        List<Voice> pending = new ArrayList<>();
++        for (SoundRecorder.Event event : snapshot.events) {
++            float[] data = pcm.get(event.key());
++            if (data == null || data.length == 0) continue;
++            Voice voice = new Voice(event, data);
++            if (voice.start >= totalSamples) continue;
++            pending.add(voice);
++        }
++        pending.sort(Comparator.comparingLong(v -> v.start));
++
++        double peak = 0;
++        try (OutputStream out = new BufferedOutputStream(new FileOutputStream(output), 1 << 16)) {
++            writeWavHeader(out, totalSamples);
++
++            List<Voice> active = new ArrayList<>();
++            int nextPending = 0;
++            float[] left = new float[CHUNK];
++            float[] right = new float[CHUNK];
++            ByteBuffer bytes = ByteBuffer.allocate(CHUNK * 4).order(ByteOrder.LITTLE_ENDIAN);
++
++            for (long chunkStart = 0; chunkStart < totalSamples; chunkStart += CHUNK) {
++                long chunkEnd = Math.min(totalSamples, chunkStart + CHUNK);
++                int length = (int) (chunkEnd - chunkStart);
++
++                while (nextPending < pending.size() && pending.get(nextPending).start < chunkEnd) {
++                    active.add(pending.get(nextPending++));
++                }
++                final long cs = chunkStart;
++                active.removeIf(v -> v.end <= cs);
++
++                java.util.Arrays.fill(left, 0, length, 0f);
++                java.util.Arrays.fill(right, 0, length, 0f);
++                for (Voice voice : active) {
++                    addVoice(snapshot, voice, chunkStart, chunkEnd, left, right);
++                }
++
++                bytes.clear();
++                for (int i = 0; i < length; i++) {
++                    short l = toPcm16(left[i]);
++                    short r = toPcm16(right[i]);
++                    peak = Math.max(peak, Math.max(Math.abs((int) l), Math.abs((int) r)) / 32767.0);
++                    bytes.putShort(l);
++                    bytes.putShort(r);
++                }
++                out.write(bytes.array(), 0, length * 4);
++            }
++        }
++        return new MixResult(pending.size(), peak);
++    }
++
++    private static void addVoice(SoundRecorder.Snapshot snapshot, Voice voice, long chunkStart, long chunkEnd, float[] left, float[] right) {
++        long from = Math.max(chunkStart, voice.start);
++        long to = Math.min(chunkEnd, voice.end);
++        if (from >= to) return;
++
++        double[] g0 = gains(snapshot, voice.event, chunkStart / (double) SAMPLE_RATE);
++        double[] g1 = gains(snapshot, voice.event, chunkEnd / (double) SAMPLE_RATE);
++        double span = Math.max(1, chunkEnd - chunkStart);
++        float[] data = voice.data;
++
++        for (long n = from; n < to; n++) {
++            double sourcePos = (n - voice.start) * voice.pitch;
++            int i = (int) sourcePos;
++            if (i >= data.length) break;
++            double frac = sourcePos - i;
++            float a = data[i];
++            float b = i + 1 < data.length ? data[i + 1] : 0f;
++            double sample = a + (b - a) * frac;
++
++            double t = (n - chunkStart) / span;
++            int idx = (int) (n - chunkStart);
++            left[idx] += (float) (sample * (g0[0] + (g1[0] - g0[0]) * t));
++            right[idx] += (float) (sample * (g0[1] + (g1[1] - g0[1]) * t));
++        }
++    }
++
++    /** @return {leftGain, rightGain} for the event at the given time. */
++    static double[] gains(SoundRecorder.Snapshot snapshot, SoundRecorder.Event event, double time) {
++        double distanceGain = 1;
++        double pan = 0;
++
++        if (!event.relative && event.attenuate && snapshot.poseCount > 0) {
++            double f = Math.max(0, Math.min(snapshot.poseCount - 1, time * snapshot.fps));
++            int i0 = (int) f;
++            int i1 = Math.min(snapshot.poseCount - 1, i0 + 1);
++            double t = f - i0;
++            double lx = lerp(snapshot.poseX[i0], snapshot.poseX[i1], t);
++            double ly = lerp(snapshot.poseY[i0], snapshot.poseY[i1], t);
++            double lz = lerp(snapshot.poseZ[i0], snapshot.poseZ[i1], t);
++            double yawDiff = ((snapshot.poseYaw[i1] - snapshot.poseYaw[i0] + 540) % 360) - 180;
++            double yaw = Math.toRadians(snapshot.poseYaw[i0] + yawDiff * t);
++
++            double dx = event.x - lx, dy = event.y - ly, dz = event.z - lz;
++            double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
++            // OpenAL linear distance clamped with reference distance 0 (what Minecraft configures)
++            distanceGain = Math.max(0, 1 - distance / Math.max(event.maxDistance, 1e-3));
++            if (distance > 1e-3) {
++                // Minecraft yaw 0 faces +Z; the listener's right-hand side is (-cos yaw, 0, -sin yaw)
++                double rx = -Math.cos(yaw), rz = -Math.sin(yaw);
++                pan = (dx * rx + dz * rz) / distance;
++                pan = Math.max(-1, Math.min(1, pan));
++            }
++        }
++
++        double base = event.volume * distanceGain;
++        double angle = (pan + 1) * Math.PI / 4;
++        return new double[]{base * Math.cos(angle), base * Math.sin(angle)};
++    }
++
++    private static double lerp(double a, double b, double t) {
++        return a + (b - a) * t;
++    }
++
++    private static short toPcm16(float v) {
++        double a = Math.abs(v);
++        // soft knee above 0.8 so loud overlaps saturate smoothly instead of hard clipping
++        double s = a < 0.8 ? a : 0.8 + 0.2 * Math.tanh((a - 0.8) / 0.2);
++        s = Math.min(1.0, s);
++        return (short) Math.round((v < 0 ? -s : s) * 32767);
++    }
++
++    private static void writeWavHeader(OutputStream out, long totalSamples) throws IOException {
++        long dataSize = totalSamples * 4; // stereo, 16 bit
++        ByteBuffer b = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
++        b.put(new byte[]{'R', 'I', 'F', 'F'});
++        b.putInt((int) Math.min(Integer.MAX_VALUE, 36 + dataSize));
++        b.put(new byte[]{'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
++        b.putInt(16);
++        b.putShort((short) 1); // PCM
++        b.putShort((short) 2); // channels
++        b.putInt(SAMPLE_RATE);
++        b.putInt(SAMPLE_RATE * 4);
++        b.putShort((short) 4);
++        b.putShort((short) 16);
++        b.put(new byte[]{'d', 'a', 't', 'a'});
++        b.putInt((int) Math.min(Integer.MAX_VALUE, dataSize));
++        out.write(b.array());
++    }
++}
+diff --git a/src/main/java/com/replaymod/render/audio/RenderAudio.java b/src/main/java/com/replaymod/render/audio/RenderAudio.java
+new file mode 100644
+index 00000000..1fdc69ac
+--- /dev/null
++++ b/src/main/java/com/replaymod/render/audio/RenderAudio.java
+@@ -0,0 +1,265 @@
++package com.replaymod.render.audio;
++
++import com.replaymod.core.versions.MCVer;
++import com.replaymod.render.RenderSettings;
++import net.minecraft.resource.Resource;
++import net.minecraft.util.Identifier;
++import org.apache.commons.io.IOUtils;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.FloatBuffer;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
++import static com.replaymod.render.ReplayModRender.LOGGER;
++
++/**
++ * Turns the sounds recorded by {@link SoundRecorder} into an audio track and adds it to the finished video using ffmpeg.
++ */
++public final class RenderAudio {
++    private RenderAudio() {}
++
++    /** Loads the raw bytes of a sound file. */
++    public interface SoundLoader {
++        byte[] load(String namespace, String path) throws IOException;
++    }
++
++    /** Loader which reads from Minecraft's resource manager (vanilla assets and resource packs). */
++    public static final SoundLoader MINECRAFT_LOADER = (namespace, path) -> {
++        Resource resource = MCVer.getMinecraft().getResourceManager().getResource(new Identifier(namespace, path));
++        try (InputStream in = resource.getInputStream()) {
++            return IOUtils.toByteArray(in);
++        }
++    };
++
++    public static void finish(File video, RenderSettings settings, int totalFrames) {
++        finish(video, settings.getExportCommandOrDefault(), totalFrames, MINECRAFT_LOADER);
++    }
++
++    /** Never throws: a failed audio step must not destroy the already rendered video. */
++    public static void finish(File video, String ffmpeg, int totalFrames, SoundLoader loader) {
++        SoundRecorder.Snapshot snapshot = SoundRecorder.end();
++        File wav = new File(video.getParentFile(), video.getName() + ".audio.wav");
++        StringBuilder report = new StringBuilder();
++        report.append("Replay Mod custom audio report\n");
++        report.append("video: ").append(video.getName()).append("\n");
++        report.append("ffmpeg: ").append(ffmpeg).append("\n");
++        report.append("frames: ").append(totalFrames).append(" @ ").append(snapshot.fps).append(" fps\n");
++        report.append(snapshot.diagnostics).append("\n");
++        try {
++            String codec = audioCodecFor(video.getName());
++            if (codec == null) {
++                report.append("RESULT: not adding sound, unsupported container (supported: mp4, mkv, mov, webm)\n");
++                return;
++            }
++            if (snapshot.events.isEmpty()) {
++                report.append("RESULT: no sounds were recorded, no audio track added\n");
++                return;
++            }
++
++            LOGGER.info("Mixing {} recorded sounds", snapshot.events.size());
++            report.append("--- recorded sounds (time s | file | volume | pitch | relative | attenuated | gainL/gainR) ---\n");
++            int listed = 0;
++            for (SoundRecorder.Event e : snapshot.events) {
++                if (listed++ >= 300) {
++                    report.append("... (").append(snapshot.events.size() - 300).append(" more)\n");
++                    break;
++                }
++                double[] g = AudioMixer.gains(snapshot, e, e.time);
++                report.append(String.format(Locale.ROOT, "%.2f | %s | %.2f | %.2f | %s | %s | %.3f/%.3f%n",
++                        e.time, e.key(), e.volume, e.pitch, e.relative, e.attenuate, g[0], g[1]));
++            }
++            report.append("--- end list ---\n");
++            Map<String, float[]> pcm = decodeAll(snapshot, ffmpeg, loader, report);
++            report.append("decoded ").append(pcm.size()).append(" distinct sound files\n");
++            AudioMixer.MixResult mix = AudioMixer.mixToWav(snapshot, pcm, totalFrames, wav);
++            report.append("mixed ").append(mix.mixed).append(" sounds, peak=").append(mix.peak).append("\n");
++            mux(ffmpeg, video, wav, codec, mix.normalizeGain());
++            report.append("RESULT: audio track added OK\n");
++        } catch (Throwable t) {
++            LOGGER.error("Failed to add sound to rendered video (the video itself is unaffected):", t);
++            java.io.StringWriter sw = new java.io.StringWriter();
++            t.printStackTrace(new java.io.PrintWriter(sw));
++            report.append("RESULT: FAILED\n").append(sw).append("\n");
++        } finally {
++            //noinspection ResultOfMethodCallIgnored
++            wav.delete();
++            try {
++                Files.write(new File(video.getParentFile(), video.getName() + ".audio-report.txt").toPath(),
++                        report.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
++            } catch (Throwable ignored) {
++            }
++        }
++    }
++
++    private static String audioCodecFor(String fileName) {
++        String name = fileName.toLowerCase(Locale.ROOT);
++        if (name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".mov") || name.endsWith(".m4v")) {
++            return "aac";
++        }
++        if (name.endsWith(".webm")) {
++            return "libopus";
++        }
++        return null;
++    }
++
++    private static Map<String, float[]> decodeAll(SoundRecorder.Snapshot snapshot, String ffmpeg, SoundLoader loader, StringBuilder report) throws Exception {
++        // Load the raw files sequentially (resource manager access), decode them in parallel
++        Map<String, byte[]> raw = new HashMap<>();
++        for (SoundRecorder.Event event : snapshot.events) {
++            String key = event.key();
++            if (raw.containsKey(key)) continue;
++            if ("meta".equals(event.namespace)) { // Minecraft's placeholder for missing sounds
++                raw.put(key, null);
++                continue;
++            }
++            try {
++                raw.put(key, loader.load(event.namespace, event.path));
++            } catch (Throwable t) {
++                LOGGER.warn("Could not load sound {}: {}", key, t.toString());
++                report.append("could not load ").append(key).append(": ").append(t).append("\n");
++                raw.put(key, null);
++            }
++        }
++
++        ExecutorService pool = Executors.newFixedThreadPool(Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors())));
++        try {
++            Map<String, Future<float[]>> futures = new HashMap<>();
++            for (Map.Entry<String, byte[]> entry : raw.entrySet()) {
++                if (entry.getValue() == null) continue;
++                byte[] bytes = entry.getValue();
++                futures.put(entry.getKey(), pool.submit(() -> decodeToMono(ffmpeg, bytes)));
++            }
++            Map<String, float[]> result = new HashMap<>();
++            for (Map.Entry<String, Future<float[]>> entry : futures.entrySet()) {
++                try {
++                    result.put(entry.getKey(), entry.getValue().get());
++                } catch (Exception e) {
++                    LOGGER.warn("Could not decode sound {}: {}", entry.getKey(), e.toString());
++                    report.append("could not decode ").append(entry.getKey()).append(": ").append(e).append("\n");
++                }
++            }
++            return result;
++        } finally {
++            pool.shutdownNow();
++        }
++    }
++
++    /** Decodes any audio file ffmpeg understands (e.g. ogg vorbis) to mono 32 bit float samples at 44.1 kHz. */
++    public static float[] decodeToMono(String ffmpeg, byte[] encoded) throws IOException, InterruptedException {
++        Process process = new ProcessBuilder(ffmpeg, "-v", "error", "-i", "pipe:0",
++                "-f", "f32le", "-ac", "1", "-ar", String.valueOf(SoundRecorder.SAMPLE_RATE), "pipe:1").start();
++        drain(process.getErrorStream());
++        Thread writer = new Thread(() -> {
++            try (OutputStream out = process.getOutputStream()) {
++                out.write(encoded);
++            } catch (IOException ignored) {
++                // ffmpeg may close its input early
++            }
++        }, "replaymod-audio-decode-writer");
++        writer.setDaemon(true);
++        writer.start();
++
++        byte[] decoded;
++        try (InputStream in = process.getInputStream()) {
++            decoded = IOUtils.toByteArray(in);
++        }
++        int exit = process.waitFor();
++        if (exit != 0 || decoded.length == 0) {
++            throw new IOException("ffmpeg exited with " + exit + " and produced " + decoded.length + " bytes");
++        }
++        FloatBuffer floats = ByteBuffer.wrap(decoded).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
++        float[] samples = new float[floats.remaining()];
++        floats.get(samples);
++        return samples;
++    }
++
++    /** Evens out loudness (game sounds like footsteps are very quiet next to e.g. block breaking) and prevents clipping. */
++    private static final String LOUDNESS_FILTER = "dynaudnorm=f=250:g=15:m=25:p=0.92,alimiter=limit=0.95";
++
++    static void mux(String ffmpeg, File video, File wav, String audioCodec, double gain) throws IOException, InterruptedException {
++        try {
++            muxOnce(ffmpeg, video, wav, audioCodec, LOUDNESS_FILTER);
++        } catch (IOException e) {
++            // e.g. an ffmpeg build without these filters: still add the audio, just without loudness processing
++            LOGGER.warn("Adding audio with loudness filter failed, retrying without it: {}", e.toString());
++            muxOnce(ffmpeg, video, wav, audioCodec, null);
++        }
++    }
++
++    private static void muxOnce(String ffmpeg, File video, File wav, String audioCodec, String filter) throws IOException, InterruptedException {
++        String name = video.getName();
++        int dot = name.lastIndexOf('.');
++        File tmp = new File(video.getParentFile(), name.substring(0, dot) + ".with-audio" + name.substring(dot));
++
++        List<String> cmd = new ArrayList<>();
++        cmd.add(ffmpeg);
++        cmd.add("-y");
++        cmd.add("-v");
++        cmd.add("error");
++        cmd.add("-i");
++        cmd.add(video.getAbsolutePath());
++        cmd.add("-i");
++        cmd.add(wav.getAbsolutePath());
++        cmd.add("-map");
++        cmd.add("0:v");
++        cmd.add("-map");
++        cmd.add("1:a");
++        cmd.add("-c:v");
++        cmd.add("copy");
++        if (filter != null) {
++            cmd.add("-af");
++            cmd.add(filter);
++        }
++        cmd.add("-c:a");
++        cmd.add(audioCodec);
++        cmd.add("-b:a");
++        cmd.add("192k");
++        cmd.add("-shortest");
++        String lower = name.toLowerCase(Locale.ROOT);
++        if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".m4v")) {
++            cmd.add("-movflags");
++            cmd.add("+faststart");
++        }
++        cmd.add(tmp.getAbsolutePath());
++
++        Process process = new ProcessBuilder(cmd).redirectErrorStream(true).start();
++        process.getOutputStream().close();
++        ByteArrayOutputStream log = new ByteArrayOutputStream();
++        try (InputStream in = process.getInputStream()) {
++            IOUtils.copy(in, log);
++        }
++        int exit = process.waitFor();
++        if (exit != 0 || !tmp.exists() || tmp.length() == 0) {
++            //noinspection ResultOfMethodCallIgnored
++            tmp.delete();
++            throw new IOException("ffmpeg failed to add audio (exit " + exit + "): " + log.toString("UTF-8"));
++        }
++        Files.move(tmp.toPath(), video.toPath(), StandardCopyOption.REPLACE_EXISTING);
++    }
++
++    private static void drain(InputStream stream) {
++        Thread thread = new Thread(() -> {
++            try {
++                IOUtils.copy(stream, new ByteArrayOutputStream());
++            } catch (IOException ignored) {
++            }
++        }, "replaymod-audio-decode-stderr");
++        thread.setDaemon(true);
++        thread.start();
++    }
++}
+diff --git a/src/main/java/com/replaymod/render/audio/SoundRecorder.java b/src/main/java/com/replaymod/render/audio/SoundRecorder.java
+new file mode 100644
+index 00000000..8c1dc555
+--- /dev/null
++++ b/src/main/java/com/replaymod/render/audio/SoundRecorder.java
+@@ -0,0 +1,202 @@
++package com.replaymod.render.audio;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.IntSupplier;
++
++/**
++ * Collects the sounds that the game would have played while a video is being rendered (rendering itself mutes
++ * all sound categories) together with the listener (camera) pose of every rendered frame.
++ * After rendering, {@link AudioMixer} turns this into an audio track.
++ *
++ * This class deliberately has no Minecraft dependencies.
++ */
++public final class SoundRecorder {
++    public static final int SAMPLE_RATE = 44100;
++
++    /** A single (one-shot) sound. */
++    public static final class Event {
++        public final double time; // seconds since video start
++        public final String namespace;
++        public final String path; // full resource path, e.g. "sounds/entity/pig/say1.ogg"
++        public final float volume; // already multiplied by category and master volume, in [0, 1]
++        public final float pitch;
++        public final double x, y, z;
++        public final boolean relative; // position relative to listener (non-positional sound)
++        public final boolean attenuate; // distance attenuation enabled
++        public final float maxDistance;
++
++        Event(double time, String namespace, String path, float volume, float pitch,
++              double x, double y, double z, boolean relative, boolean attenuate, float maxDistance) {
++            this.time = time;
++            this.namespace = namespace;
++            this.path = path;
++            this.volume = volume;
++            this.pitch = pitch;
++            this.x = x;
++            this.y = y;
++            this.z = z;
++            this.relative = relative;
++            this.attenuate = attenuate;
++            this.maxDistance = maxDistance;
++        }
++
++        public String key() {
++            return namespace + ":" + path;
++        }
++    }
++
++    /** Immutable result of a recording session. */
++    public static final class Snapshot {
++        public final int fps;
++        public final List<Event> events;
++        public final double[] poseX, poseY, poseZ, poseYaw; // indexed by frame
++        public final int poseCount;
++        public final String diagnostics;
++
++        Snapshot(int fps, List<Event> events, double[] x, double[] y, double[] z, double[] yaw, int poseCount, String diagnostics) {
++            this.diagnostics = diagnostics;
++            this.fps = fps;
++            this.events = events;
++            this.poseX = x;
++            this.poseY = y;
++            this.poseZ = z;
++            this.poseYaw = yaw;
++            this.poseCount = poseCount;
++        }
++    }
++
++    // Diagnostics (written to a small report file next to the video)
++    public static final int SEEN = 0, RECORDED = 1, SKIPPED_GUI = 2, SKIPPED_LOOPING = 3, SKIPPED_STREAMED_OR_MISSING = 4, SILENT = 5, FAILURES = 6;
++    private static final int[] stats = new int[7];
++    private static String lastFailure = "";
++
++    public static synchronized void count(int what) {
++        if (recording) stats[what]++;
++    }
++
++    public static synchronized void failure(Throwable t) {
++        if (recording) {
++            stats[FAILURES]++;
++            lastFailure = t.toString();
++        }
++    }
++
++    private static synchronized String diagnostics() {
++        return "play() calls seen=" + stats[SEEN]
++                + ", recorded=" + stats[RECORDED]
++                + ", skipped(gui)=" + stats[SKIPPED_GUI]
++                + ", skipped(looping)=" + stats[SKIPPED_LOOPING]
++                + ", skipped(streamed/missing)=" + stats[SKIPPED_STREAMED_OR_MISSING]
++                + ", dropped(silent volume)=" + stats[SILENT]
++                + ", errors=" + stats[FAILURES] + (lastFailure.isEmpty() ? "" : " (last: " + lastFailure + ")")
++                + ", listener poses=" + poseCount
++                + ", master=" + masterVolume + ", categories=" + categoryVolumes;
++    }
++
++    private static volatile boolean recording;
++    private static int fps;
++    private static IntSupplier frameSupplier;
++    private static float masterVolume = 1;
++    private static Map<String, Float> categoryVolumes = new HashMap<>();
++    private static final List<Event> events = new ArrayList<>();
++    private static double[] poseX = new double[0], poseY = new double[0], poseZ = new double[0], poseYaw = new double[0];
++    private static int poseCount;
++
++    private SoundRecorder() {}
++
++    public static boolean isRecording() {
++        return recording;
++    }
++
++    /**
++     * @param framesDone supplies the index of the frame currently being prepared (i.e. frames already finished)
++     * @param categoryVolumes the user's real volume sliders by sound category name (rendering mutes them)
++     */
++    public static synchronized void begin(int fps, IntSupplier framesDone, Map<String, Float> categoryVolumes, float masterVolume) {
++        events.clear();
++        poseCount = 0;
++        SoundRecorder.fps = fps;
++        SoundRecorder.frameSupplier = framesDone;
++        SoundRecorder.categoryVolumes = new HashMap<>(categoryVolumes);
++        SoundRecorder.masterVolume = masterVolume;
++        java.util.Arrays.fill(stats, 0);
++        lastFailure = "";
++        recording = true;
++    }
++
++    public static synchronized void abort() {
++        recording = false;
++        events.clear();
++        poseCount = 0;
++        frameSupplier = null;
++    }
++
++    /** Stops recording and returns everything that was recorded. */
++    public static synchronized Snapshot end() {
++        recording = false;
++        Snapshot snapshot = new Snapshot(
++                fps,
++                new ArrayList<>(events),
++                java.util.Arrays.copyOf(poseX, poseCount),
++                java.util.Arrays.copyOf(poseY, poseCount),
++                java.util.Arrays.copyOf(poseZ, poseCount),
++                java.util.Arrays.copyOf(poseYaw, poseCount),
++                poseCount,
++                diagnostics()
++        );
++        events.clear();
++        poseCount = 0;
++        frameSupplier = null;
++        return snapshot;
++    }
++
++    public static synchronized void recordSound(
++            String category, String namespace, String path,
++            float volume, float pitch,
++            double x, double y, double z,
++            boolean relative, boolean attenuate, float attenuationDistance
++    ) {
++        if (!recording || frameSupplier == null) return;
++        float categoryVolume = categoryVolumes.getOrDefault(category, 1f);
++        float gain = clamp(volume, 0, 1) * clamp(categoryVolume, 0, 1) * clamp(masterVolume, 0, 1);
++        if (gain <= 0) {
++            stats[SILENT]++;
++            return;
++        }
++        double time = frameSupplier.getAsInt() / (double) fps;
++        float maxDistance = Math.max(volume, 1) * attenuationDistance;
++        stats[RECORDED]++;
++        events.add(new Event(time, namespace, path, gain, clamp(pitch, 0.5f, 2f), x, y, z, relative, attenuate, maxDistance));
++    }
++
++    /** Records the listener pose for the given frame (a later call for the same frame overwrites the earlier one). */
++    public static synchronized void recordListener(int frame, double x, double y, double z, float yawDegrees) {
++        if (!recording || frame < 0) return;
++        if (frame >= poseX.length) {
++            int size = Math.max(frame + 1, poseX.length * 2 + 16);
++            poseX = java.util.Arrays.copyOf(poseX, size);
++            poseY = java.util.Arrays.copyOf(poseY, size);
++            poseZ = java.util.Arrays.copyOf(poseZ, size);
++            poseYaw = java.util.Arrays.copyOf(poseYaw, size);
++        }
++        // Fill any gap with the new pose so lookups never read garbage
++        for (int i = poseCount; i < frame; i++) {
++            poseX[i] = x;
++            poseY[i] = y;
++            poseZ[i] = z;
++            poseYaw[i] = yawDegrees;
++        }
++        poseX[frame] = x;
++        poseY[frame] = y;
++        poseZ[frame] = z;
++        poseYaw[frame] = yawDegrees;
++        poseCount = Math.max(poseCount, frame + 1);
++    }
++
++    private static float clamp(float v, float min, float max) {
++        return v < min ? min : (v > max ? max : v);
++    }
++}
+diff --git a/src/main/java/com/replaymod/render/gui/GuiExportFailed.java b/src/main/java/com/replaymod/render/gui/GuiExportFailed.java
+index 56f9229f..14778de4 100644
+--- a/src/main/java/com/replaymod/render/gui/GuiExportFailed.java
++++ b/src/main/java/com/replaymod/render/gui/GuiExportFailed.java
+@@ -104,7 +104,7 @@ public class GuiExportFailed extends GuiScreen {
+                     oldSettings.getExportCommand(),
+                     oldSettings.getEncodingPreset().getValue(),
+                     oldSettings.isHighPerformance()
+-            ));
++            ).withCustomOptionsFrom(oldSettings));
+         }));
+ 
+         abortButton.onClick(() -> {
+diff --git a/src/main/java/com/replaymod/render/gui/GuiRenderSettings.java b/src/main/java/com/replaymod/render/gui/GuiRenderSettings.java
+index 170aa21a..fadc1581 100644
+--- a/src/main/java/com/replaymod/render/gui/GuiRenderSettings.java
++++ b/src/main/java/com/replaymod/render/gui/GuiRenderSettings.java
+@@ -148,6 +148,12 @@ public class GuiRenderSettings extends AbstractGuiPopup<GuiRenderSettings> {
+     public final GuiCheckbox nametagCheckbox = new GuiCheckbox()
+             .setI18nLabel("replaymod.gui.rendersettings.nametags");
+ 
++    public final GuiCheckbox hudCheckbox = new GuiCheckbox()
++            .setLabel("Render HUD (hotbar, crosshair, hand) - Default render method only");
++
++    public final GuiCheckbox soundCheckbox = new GuiCheckbox()
++            .setLabel("Record game sound into video (stereo)");
++
+     public final GuiCheckbox alphaCheckbox = new GuiCheckbox()
+             .setI18nLabel("replaymod.gui.rendersettings.includealpha");
+ 
+@@ -190,7 +196,7 @@ public class GuiRenderSettings extends AbstractGuiPopup<GuiRenderSettings> {
+             .setSize(200, 20).setValues(RenderSettings.AntiAliasing.values()).setSelected(RenderSettings.AntiAliasing.NONE);
+ 
+     public final GuiPanel advancedPanel = new GuiPanel().setLayout(new VerticalLayout().setSpacing(15))
+-            .addElements(null, nametagCheckbox, alphaCheckbox, new GuiPanel().setLayout(
++            .addElements(null, nametagCheckbox, hudCheckbox, soundCheckbox, alphaCheckbox, new GuiPanel().setLayout(
+                     new GridLayout().setCellsEqualSize(false).setColumns(2).setSpacingX(5).setSpacingY(15))
+                     .addElements(new GridLayout.Data(0, 0.5),
+                             new GuiLabel().setI18nText("replaymod.gui.rendersettings.stabilizecamera"), stabilizePanel,
+@@ -525,6 +531,8 @@ public class GuiRenderSettings extends AbstractGuiPopup<GuiRenderSettings> {
+         }
+         outputFileButton.setLabel(this.outputFile.getName());
+         nametagCheckbox.setChecked(settings.isRenderNameTags());
++        hudCheckbox.setChecked(settings.isRenderHudRaw());
++        soundCheckbox.setChecked(settings.isRecordSound());
+         alphaCheckbox.setChecked(settings.isIncludeAlphaChannel());
+         stabilizeYaw.setChecked(settings.isStabilizeYaw());
+         stabilizePitch.setChecked(settings.isStabilizePitch());
+@@ -577,7 +585,7 @@ public class GuiRenderSettings extends AbstractGuiPopup<GuiRenderSettings> {
+                 exportCommand.getText(),
+                 exportArguments.getText(),
+                 net.minecraft.client.gui.screen.Screen.hasControlDown()
+-        );
++        ).withCustomOptions(hudCheckbox.isChecked(), soundCheckbox.isChecked());
+     }
+ 
+     protected File generateOutputFile(RenderSettings.EncodingPreset encodingPreset) {
+diff --git a/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java b/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
+index ee68b87e..9de3231b 100644
+--- a/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
++++ b/src/main/java/com/replaymod/render/hooks/EntityRendererHandler.java
+@@ -7,12 +7,15 @@ import com.replaymod.render.RenderSettings;
+ import com.replaymod.render.Setting;
+ import com.replaymod.render.capturer.CaptureData;
+ import com.replaymod.render.capturer.RenderInfo;
++import com.replaymod.render.audio.SoundRecorder;
+ import com.replaymod.render.capturer.WorldRenderer;
+ import com.replaymod.render.mixin.GameRendererAccessor;
+ import com.replaymod.replay.ReplayModReplay;
+ import de.johni0702.minecraft.gui.utils.EventRegistrations;
+ import net.minecraft.client.MinecraftClient;
+ import net.minecraft.client.gui.screen.Screen;
++import net.minecraft.client.render.Camera;
++import net.minecraft.util.math.Vec3d;
+ 
+ //#if MC>=11400
+ import com.replaymod.core.events.PostRenderCallback;
+@@ -103,6 +106,13 @@ public class EntityRendererHandler extends EventRegistrations implements WorldRe
+                 //$$ mc.entityRenderer.updateCameraAndRender(partialTicks);
+                 //#endif
+                 //#endif
++
++                if (!omnidirectional && SoundRecorder.isRecording()) {
++                    // Remember where the listener (camera) was for this frame, used to position recorded sounds
++                    Camera camera = mc.gameRenderer.getCamera();
++                    Vec3d camPos = camera.getPos();
++                    SoundRecorder.recordListener(renderInfo.getFramesDone() - 1, camPos.x, camPos.y, camPos.z, camera.getYaw());
++                }
+             } finally {
+                 mc.currentScreen = orgScreen;
+                 mc.options.pauseOnLostFocus = orgPauseOnLostFocus;
+diff --git a/src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java b/src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
+new file mode 100644
+index 00000000..ca32fa24
+--- /dev/null
++++ b/src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
+@@ -0,0 +1,67 @@
++package com.replaymod.render.mixin;
++
++import com.replaymod.core.versions.MCVer;
++import com.replaymod.render.audio.SoundRecorder;
++import net.minecraft.client.sound.Sound;
++import net.minecraft.client.sound.SoundInstance;
++import net.minecraft.client.sound.SoundSystem;
++import net.minecraft.sound.SoundCategory;
++import net.minecraft.util.Identifier;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Records every sound the game starts while a video is rendered (the renderer mutes all sound categories,
++ * so nothing would be audible otherwise). The sounds are mixed into an audio track after rendering.
++ */
++@Mixin(SoundSystem.class)
++public abstract class Mixin_RecordSounds {
++    @Inject(method = "play(Lnet/minecraft/client/sound/SoundInstance;)V", at = @At("HEAD"))
++    private void replayModRender_recordSound(SoundInstance instance, CallbackInfo ci) {
++        if (!SoundRecorder.isRecording()) {
++            return;
++        }
++        try {
++            SoundRecorder.count(SoundRecorder.SEEN);
++            if (instance.getCategory() == SoundCategory.MASTER) {
++                SoundRecorder.count(SoundRecorder.SKIPPED_GUI);
++                return; // GUI sounds (buttons, ...)
++            }
++            if (instance.isRepeatable() || !instance.canPlay()) {
++                SoundRecorder.count(SoundRecorder.SKIPPED_LOOPING);
++                return; // looping sounds would need start/stop tracking; not supported
++            }
++            if (instance.getSoundSet(MCVer.getMinecraft().getSoundManager()) == null) {
++                SoundRecorder.count(SoundRecorder.SKIPPED_STREAMED_OR_MISSING);
++                return;
++            }
++            Sound sound = instance.getSound();
++            if (sound == null || sound.isStreamed()) {
++                SoundRecorder.count(SoundRecorder.SKIPPED_STREAMED_OR_MISSING);
++                return; // music / long streamed sounds are not recorded
++            }
++            Identifier location = sound.getLocation();
++            String path = location.getPath();
++            if (!path.startsWith("sounds/")) {
++                path = "sounds/" + path;
++            }
++            if (!path.endsWith(".ogg")) {
++                path = path + ".ogg";
++            }
++            boolean attenuate = "LINEAR".equals(instance.getAttenuationType().name());
++            SoundRecorder.recordSound(
++                    instance.getCategory().getName(),
++                    location.getNamespace(), path,
++                    instance.getVolume(), instance.getPitch(),
++                    instance.getX(), instance.getY(), instance.getZ(),
++                    instance.isLooping() /* 1.16.4 name of the "relative" flag, remapped for newer versions */, attenuate, sound.getAttenuation()
++            );
++        } catch (Throwable t) {
++            // Never break the game because of audio recording
++            SoundRecorder.failure(t);
++            com.replaymod.render.ReplayModRender.LOGGER.debug("Failed to record sound", t);
++        }
++    }
++}
+diff --git a/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java b/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java
+index 328b726d..55cdf5a0 100644
+--- a/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java
++++ b/src/main/java/com/replaymod/render/mixin/Mixin_SkipHudDuringRender.java
+@@ -16,7 +16,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+ public abstract class Mixin_SkipHudDuringRender {
+     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
+     private void replayModRender_skipHudDuringRender(CallbackInfo ci) {
+-        if (((EntityRendererHandler.IEntityRenderer) MinecraftClient.getInstance().gameRenderer).replayModRender_getHandler() != null) {
++        EntityRendererHandler handler = ((EntityRendererHandler.IEntityRenderer) MinecraftClient.getInstance().gameRenderer).replayModRender_getHandler();
++        if (handler != null && !handler.getSettings().isRenderHud()) {
+             ci.cancel();
+         }
+     }
+diff --git a/src/main/java/com/replaymod/render/rendering/VideoRenderer.java b/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
+index 09743225..22db036f 100644
+--- a/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
++++ b/src/main/java/com/replaymod/render/rendering/VideoRenderer.java
+@@ -13,6 +13,8 @@ import com.replaymod.render.PNGWriter;
+ import com.replaymod.render.RenderSettings;
+ import com.replaymod.render.ReplayModRender;
+ import com.replaymod.render.FFmpegWriter;
++import com.replaymod.render.audio.RenderAudio;
++import com.replaymod.render.audio.SoundRecorder;
+ import com.replaymod.render.blend.BlendState;
+ import com.replaymod.render.capturer.RenderInfo;
+ import com.replaymod.render.events.ReplayRenderCallback;
+@@ -76,6 +78,7 @@ import java.util.concurrent.CompletableFuture;
+ import java.io.IOException;
+ import java.util.Collection;
+ import java.util.EnumMap;
++import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
+@@ -184,6 +187,24 @@ public class VideoRenderer implements RenderInfo {
+      * @return {@code true} if rendering was successful, {@code false} if the user aborted rendering (or the window was closed)
+      */
+     public boolean renderVideo() throws Throwable {
++        try {
++            return renderVideoUnsafe();
++        } catch (Throwable t) {
++            // Rendering mutes all sound categories; never leave them muted (they get saved to options.txt) if it fails
++            restoreSoundLevels();
++            throw t;
++        }
++    }
++
++    private void restoreSoundLevels() {
++        if (originalSoundLevels != null) {
++            for (Map.Entry<SoundCategory, Float> entry : originalSoundLevels.entrySet()) {
++                mc.options.setSoundVolume(entry.getKey(), entry.getValue());
++            }
++        }
++    }
++
++    private boolean renderVideoUnsafe() throws Throwable {
+         ReplayRenderCallback.Pre.EVENT.invoker().beforeRendering(this);
+ 
+         setup();
+@@ -227,12 +248,43 @@ public class VideoRenderer implements RenderInfo {
+         //$$ ((WorldRendererAccessor) mc.worldRenderer).setRenderEntitiesStartupCounter(0);
+         //#endif
+ 
+-        renderingPipeline.run();
++        boolean recordSound = ffmpegWriter != null && settings.isRecordSound();
++        if (recordSound) {
++            Map<String, Float> categoryVolumes = new HashMap<>();
++            for (Map.Entry<SoundCategory, Float> entry : originalSoundLevels.entrySet()) {
++                categoryVolumes.put(entry.getKey().getName(), entry.getValue());
++            }
++            SoundRecorder.begin(fps, () -> framesDone, categoryVolumes, mc.options.getSoundVolume(SoundCategory.MASTER));
++        }
++        try {
++            renderingPipeline.run();
++        } catch (Throwable t) {
++            if (recordSound) {
++                SoundRecorder.abort();
++            }
++            throw t;
++        }
+ 
+         if (((MinecraftAccessor) mc).getCrashReporter() != null) {
++            if (recordSound) {
++                SoundRecorder.abort();
++            }
+             throw new CrashException(((MinecraftAccessor) mc).getCrashReporter());
+         }
+ 
++        if (recordSound) {
++            if (cancelled || hasFailed()) {
++                SoundRecorder.abort();
++            } else {
++                try {
++                    RenderAudio.finish(ffmpegWriter.getVideoFile(), settings, framesDone);
++                } catch (Throwable t) {
++                    SoundRecorder.abort();
++                    LOGGER.error("Failed to add sound to the rendered video:", t);
++                }
++            }
++        }
++
+         if (settings.isInjectSphericalMetadata()) {
+             MetadataInjector.injectMetadata(settings.getRenderMethod(), settings.getOutputFile(),
+                     settings.getTargetVideoWidth(), settings.getTargetVideoHeight(),
+diff --git a/src/main/java/com/replaymod/replay/gui/overlay/GuiReplayOverlay.java b/src/main/java/com/replaymod/replay/gui/overlay/GuiReplayOverlay.java
+index 14bef7b1..4a292f30 100644
+--- a/src/main/java/com/replaymod/replay/gui/overlay/GuiReplayOverlay.java
++++ b/src/main/java/com/replaymod/replay/gui/overlay/GuiReplayOverlay.java
+@@ -156,6 +156,11 @@ public class GuiReplayOverlay extends AbstractGuiOverlay<GuiReplayOverlay> {
+ 
+     @Override
+     public void draw(GuiRenderer renderer, ReadableDimension size, RenderInfo renderInfo) {
++        // Never draw the replay timeline/controls into a video being rendered (the in-game HUD may be rendered)
++        if (((com.replaymod.render.hooks.EntityRendererHandler.IEntityRenderer) getMinecraft().gameRenderer)
++                .replayModRender_getHandler() != null) {
++            return;
++        }
+         // Do not render overlay if all hud, or this one specifically, is hidden and we're not in some popup
+         if ((getMinecraft().options.hudHidden || hidden) && isAllowUserInput()) {
+             // Note that this only applies to when the mouse is visible, otherwise
+diff --git a/src/main/resources/mixins.render.replaymod.json b/src/main/resources/mixins.render.replaymod.json
+index bd3761e4..cbb3a9e0 100644
+--- a/src/main/resources/mixins.render.replaymod.json
++++ b/src/main/resources/mixins.render.replaymod.json
+@@ -21,6 +21,7 @@
+     "Mixin_Omnidirectional_Rotation",
+     "Mixin_PreserveDepthDuringGuiRendering",
+     "Mixin_PreserveDepthDuringHandRendering",
++    "Mixin_RecordSounds",
+     "Mixin_SkipBlockOutlinesDuringRender",
+     "Mixin_SkipHudDuringRender",
+     "Mixin_StabilizeCamera",
