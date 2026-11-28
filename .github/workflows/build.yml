@@ -35,6 +35,18 @@ jobs:
           sed -i '0,/    mavenLocal()/s||    mavenLocal()\n    maven("https://libraries.minecraft.net/")|' build.gradle.kts
           sed -n 38,46p build.gradle.kts
 
+      - name: Make Mojang's library repository available to every Gradle project
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/mojang-libraries.gradle <<'GRADLE'
+          allprojects {
+              repositories {
+                  maven { url = uri("https://libraries.minecraft.net/") }
+              }
+          }
+          GRADLE
+          cat ~/.gradle/init.d/mojang-libraries.gradle
+
       - name: Build Replay Mod for 26.3
         shell: bash
         working-directory: /tmp/rm
