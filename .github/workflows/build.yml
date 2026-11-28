@@ -13,11 +13,12 @@ jobs:
 
       # Gradle itself must run on Java 21 (the Java downgrader used by ReplayStudio cannot read Java 25 classes),
       # the last JDK listed becomes the default. Minecraft 26.x is compiled with Java 25 through Gradle toolchains.
-      - name: Set up JDKs (17, 25 and finally 21 as the default)
+      - name: Set up JDKs (8, 17, 25 and finally 21 as the default)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: |
+            8
             17
             25
             21
@@ -34,7 +35,7 @@ jobs:
       - name: Build Replay Mod for 26.3
         shell: bash
         working-directory: /tmp/rm
-        run: ./gradlew :26.3:bundleJar --no-daemon --stacktrace -Porg.gradle.java.installations.fromEnv=JAVA_HOME_17_X64,JAVA_HOME_21_X64,JAVA_HOME_25_X64 2>&1 | tee /tmp/build.log
+        run: ./gradlew :26.3:bundleJar --no-daemon --stacktrace -Porg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64,JAVA_HOME_17_X64,JAVA_HOME_21_X64,JAVA_HOME_25_X64 2>&1 | tee /tmp/build.log
 
       - name: Show only the errors (copy this step's output if the build failed)
         if: failure()
