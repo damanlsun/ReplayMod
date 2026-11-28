@@ -31,6 +31,9 @@ jobs:
           git checkout 13ca34329be20fd3f3d2b2ccb4512c7d3f028871
           git submodule update --init --recursive
           git apply --verbose /tmp/custom.patch
+          # Minecraft 26.2/26.3 need libraries that only Mojang's repository has
+          sed -i '0,/    mavenLocal()/s||    mavenLocal()\n    maven("https://libraries.minecraft.net/")|' build.gradle.kts
+          sed -n 38,46p build.gradle.kts
 
       - name: Build Replay Mod for 26.3
         shell: bash
