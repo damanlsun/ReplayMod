@@ -43,6 +43,15 @@ jobs:
               repositories {
                   maven { url = uri("https://libraries.minecraft.net/") }
               }
+              afterEvaluate { p ->
+                  // add again after the project's own setup, in case it replaced the repository list
+                  p.repositories {
+                      maven { url = uri("https://libraries.minecraft.net/") }
+                  }
+                  if (p.path.startsWith(":26")) {
+                      println "REPOS of ${p.path}: " + p.repositories.collect { (it.hasProperty('url') ? it.url : it.name) }
+                  }
+              }
           }
           GRADLE
           cat ~/.gradle/init.d/mojang-libraries.gradle
