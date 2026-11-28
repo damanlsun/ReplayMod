@@ -1,4 +1,4 @@
-name: Build custom Replay Mod
+name: Build custom Replay Mod 26.3
 
 on:
   workflow_dispatch:
@@ -6,64 +6,53 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
-      - name: Check out fork (full history)
+      - name: Check out this fork (only needed to get the patch)
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Set up JDKs (Minecraft 26.x needs Java 25, older modules need 17/21)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: |
+            17
+            21
+            25
 
-      - name: Keep the patch, switch to the Replay Mod 2.6.15 source
+      - name: Get the official Replay Mod 2.6.28 source and apply the patch
         run: |
-          cp replaymod-1.19.2-custom.patch /tmp/custom.patch
-          git checkout -f 706d46f6
+          cp replaymod-26.3-custom.patch /tmp/custom.patch
+          git clone https://github.com/ReplayMod/ReplayMod /tmp/rm
+          cd /tmp/rm
+          git checkout 13ca34329be20fd3f3d2b2ccb4512c7d3f028871
           git submodule update --init --recursive
+          git apply --verbose /tmp/custom.patch
 
-      - name: Apply patch
-        run: git apply --verbose /tmp/custom.patch
-
-      - name: Fix 1.16.4 method name (safe even if the patch already has it)
-        run: |
-          sed -i 's/instance\.isRelative()/instance.isLooping()/' src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
-          grep -n "isLooping\|isRelative" src/main/java/com/replaymod/render/mixin/Mixin_RecordSounds.java
-
-      - name: Build the preprocessor plugin locally (the JitPack copy is missing)
-        run: |
-          git clone https://github.com/ReplayMod/preprocessor /tmp/preprocessor
-          cd /tmp/preprocessor
-          git checkout 48e02ad
-          sed -i 's/version = "SNAPSHOT"/version = "48e02ad"/' build.gradle.kts
-          ./gradlew publishToMavenLocal --no-daemon --stacktrace
-
-      - name: Build Replay Mod
+      - name: Build Replay Mod for 26.3
         shell: bash
-        run: ./gradlew :1.19.2:bundleJar --no-daemon 2>&1 | tee build.log
+        working-directory: /tmp/rm
+        run: ./gradlew :26.3:bundleJar --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
 
       - name: Show only the errors (copy this step's output if the build failed)
         if: failure()
         shell: bash
         run: |
           echo "=== compile errors ==="
-          grep -n -B1 -A4 -E "error:|error\[|\.java:[0-9]+: " build.log | head -150
+          grep -n -B1 -A4 -E "error:|error\[|\.java:[0-9]+: " /tmp/build.log | head -200
           echo "=== what went wrong ==="
-          grep -n -A12 "What went wrong" build.log | head -60
+          grep -n -A12 "What went wrong" /tmp/build.log | head -60
 
       - name: Upload full build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
+          path: /tmp/build.log
           if-no-files-found: ignore
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: replaymod-1.19.2-custom
-          path: versions/1.19.2/build/libs/*.jar
+          name: replaymod-26.3-custom
+          path: /tmp/rm/versions/26.3/build/libs/*.jar
